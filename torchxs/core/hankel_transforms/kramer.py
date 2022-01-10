@@ -1,4 +1,5 @@
 import torch
+import torch.optim
 from torch import nn
 from torch.functional import F
 import numpy as np
@@ -8,11 +9,13 @@ import einops
 
 import matplotlib.pyplot as plt
 
-
 class Kramer_fit(nn.Module):
-    def __init__(self, q_tensor, i_obs, s_obs, radius, padding=5, porod_factor=6.0):
-
+    def __init__(self, q_tensor, i_obs, s_obs, radius, padding=5, porod_factor=8.0):
         super().__init__()
+
+        self.max_w = 140.0
+        self.min_w = -180
+
         self.porod_factor=porod_factor
         self.q_tensor = q_tensor
 
@@ -27,8 +30,10 @@ class Kramer_fit(nn.Module):
         self.qks = self.alphas / ( 2.0 * self.radius)
 
         self.Skq = self.intensity_basis_functions()
-        weights = torch.log(self.initial_guess())
-        self.weights = nn.Parameter(weights)
+        weights = self.initial_guess()
+        self.weights = nn.Parameter(torch.log(torch.abs(weights)))
+        #self.log_scale = nn.Parameter(torch.Tensor([0]))
+        self.log_bg = nn.Parameter( torch.min(torch.log(torch.abs(weights)/20.0)) )
 
     def intensity_basis_functions(self):
         t = self.q_tensor * self.radius * 2.0
@@ -38,7 +43,7 @@ class Kramer_fit(nn.Module):
         result = 2.0*tmp_top/tmp_bottom
         return result.T
 
-    def initial_guess(self):
+    def initial_guess(self, delta_index=2):
         Iqks = []
         for kk, qk in enumerate(self.qks):
             if qk < torch.max(self.q_tensor):
@@ -52,12 +57,85 @@ class Kramer_fit(nn.Module):
 
     def forward(self):
         result = torch.matmul( self.Skq,torch.exp(self.weights))
-        return result
+        return result + torch.exp(self.log_bg)
+
+def training_loop(model, optimizer, n=1000):
+    losses = []
+    y = model.i_obs
+    s = model.s_obs
+    for i in range(n):
+        preds = model()
+        loss = F.l1_loss(preds/s, y/s).sqrt()
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        losses.append(loss.item())
+    return losses
+
+def lbfgs_training(model,
+                   loss_fn,
+                   max_iter_adam=1000,
+                   max_iter_lbfgs=1000,
+                   conv_eps=1e-12,
+                   learning_rate_adam=1e-3,
+                   learning_rate_lbfgs=0.75):
+    y = model.i_obs
+    s = model.s_obs
+    # first we do a few rounds of ADAM
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate_adam)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=0)
+
+    for ii in range(max_iter_adam):
+        optimizer.zero_grad()
+        preds = model()
+        loss = loss_fn(preds / s, y / s)
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+
+    optimizer = torch.optim.LBFGS([model.weights],
+                                  history_size=len(model.weights)*5+10,
+                                  max_iter=max_iter_lbfgs,
+                                  lr=learning_rate_lbfgs,
+                                  line_search_fn='strong_wolfe')
+    def closure():
+        if torch.is_grad_enabled():
+            optimizer.zero_grad()
+        output = model()
+        loss = loss_fn(output/s, y/s)
+        if loss.requires_grad:
+            loss.backward()
+        return loss
+
+    history = []
+    for ii in range(max_iter_lbfgs):
+        before = model.weights.clone()
+        history.append(before)
+        optimizer.step(closure)
+        after = model.weights
+        sel = torch.isnan(after)
+        if torch.sum(sel).item() > 0:
+            jitter = (2.0*torch.rand(before.shape)-1.0)*0.05 + 1.0
+            model.weights = nn.Parameter( before*jitter )
+        else:
+            delta = torch.mean(torch.abs(before-after)) / torch.mean( torch.abs(before))
+            if delta < conv_eps:
+                break
+
+    with torch.no_grad():
+        output = model()
+        loss = loss_fn(output / s, y / s)
+    return loss
+
+
+
 
 class Kramer_interpolator(nn.Module):
     def __init__(self, radius, q_max=None, padding=None, Iqks=None):
         super().__init__()
         self.radius = radius
+        self.radius = nn.Parameter(torch.Tensor([self.radius]))
         self.q_max = q_max
         self.padding = padding
         if q_max is None:
@@ -94,60 +172,103 @@ class Kramer_interpolator(nn.Module):
 
 
 
+def training(model,
+                   loss_fn,
+                   q_in,
+                   i_obs,
+                   s_obs,
+                   max_iter_adam=100,
+                   learning_rate=1e-3):
+    x = q_in
+    y = i_obs
+    s = s_obs
+    # first we do a few rounds of ADAM
 
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-def training_loop(model, optimizer, n=1000):
-    "Training loop for torch model."
-    losses = []
-
-    y = model.i_obs
-    s = model.s_obs
-
-    for i in range(n):
-        preds = model()
-        loss = F.l1_loss(preds/s, y/s).sqrt()
+    for ii in range(max_iter_adam):
+        preds = model(x)
+        loss = loss_fn(preds / s, y / s)
+        print("Loss", loss)
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
-        losses.append(loss.item())
-    return losses
+
+    with torch.no_grad():
+        output = model(x)
+        loss = F.mse_loss(output / s, y / s)
+        if str(loss.item()) == "nan":
+            print(model.weights)
+    return loss
+
+
+
 
 
 
 if __name__ == "__main__":
-    q_obs_max = 0.65
-    N_obs = 1350
-    q_obs = torch.Tensor(np.linspace(0.005, q_obs_max, N_obs))
-    Iobs = 0
-    radius = 100
-    ws = 0.0
-    sr = .3
-    Iobs = gaussian_mixture_of_spheres.i_of_q(q_obs,radius,8)+1e-8
 
-    Iobs1 = torch.abs(torch.normal(Iobs, ((q_obs ) ** 0.50) * Iobs / 0.5))
-    Iobs2 = torch.abs(torch.normal(Iobs, ((q_obs ) ** 0.50) * Iobs / 0.5))
-    Iobs3 = torch.abs(torch.normal(Iobs, ((q_obs ) ** 0.50) * Iobs / 0.5))
-    Iobs4 = torch.abs(torch.normal(Iobs, ((q_obs ) ** 0.50) * Iobs / 0.5))
-    Iobs5 = torch.abs(torch.normal(Iobs, ((q_obs ) ** 0.50) * Iobs / 0.5))
+    #Define data
+    q_obs_max = 0.55
+    N_obs = 55
+    q_obs = torch.Tensor(np.linspace(0.01, q_obs_max, N_obs))
+    Iobs = 0
+    radius = 30
+    ws = 0.0
+    sr = 0.01
+    Iobs = gaussian_mixture_of_spheres.i_of_q(q_obs,radius,sr)
+    Iobs1 = torch.abs(torch.normal(Iobs, ((q_obs ) ** 0.50) * Iobs / 1.5))
+    Iobs2 = torch.abs(torch.normal(Iobs, ((q_obs ) ** 0.50) * Iobs / 1.5))
+    Iobs3 = torch.abs(torch.normal(Iobs, ((q_obs ) ** 0.50) * Iobs / 1.5))
+    Iobs4 = torch.abs(torch.normal(Iobs, ((q_obs ) ** 0.50) * Iobs / 1.5))
+    Iobs5 = torch.abs(torch.normal(Iobs, ((q_obs ) ** 0.50) * Iobs / 1.5))
     Iobs = einops.rearrange([Iobs1, Iobs2, Iobs3, Iobs4, Iobs5], "N X -> N X")
 
-    m = torch.mean(Iobs, dim=0)
+    m = 1.01*torch.mean(Iobs, dim=0)+1e-5
     s = torch.std(Iobs, dim=0) / 2
     plt.plot(q_obs.numpy(), m, '.')
     plt.xlim(0, q_obs_max * 1.05)
     plt.yscale('log')
     plt.show()
 
-    obj1 = Kramer_fit(q_obs,m,s, radius+50, padding=1000)
-    optim1 = torch.optim.Adam(obj1.parameters(), lr=5e-4)
-    losses1 = training_loop(obj1, optim1)
+    radius_range = range(15,75,1)
+
+    scores = []
+    k = []
+    bgs = []
+    for this_rad in radius_range:
+        obj1 = Kramer_fit(q_obs,m,s, this_rad, padding=1)
+        loss1 = lbfgs_training(obj1, F.l1_loss)
+        bgs.append(obj1.log_bg.detach().numpy())
+        print("AFTER", obj1.weights,  obj1.log_bg)
+        k.append(len(obj1.weights))
+        scores.append(loss1)
+    plt.plot(radius_range, scores)
+    #plt.yscale('log')
+    plt.show()
+    plt.plot(scores, bgs, '.')
+    plt.xscale('log')
+    plt.show()
+
+    k = np.array(k)
+    print(k)
+    scores = np.array(scores)
+    aic = 2*k + 350.0*np.log(scores) #- 350.0*np.log(350)
+    bic = np.log(350)*k + 350.0*np.log(scores) #- 350.0*np.log(350)
+
+    minaic = np.min(bic)
+
+    plt.plot(radius_range, np.exp(-(bic-minaic)))
+    plt.show()
+
+    """obj1 = Kramer_fit(q_obs, m, s, radius, padding=5)
     Iqks = torch.exp(obj1.weights)
 
-    obj2 = Kramer_interpolator(radius=radius+50, Iqks=Iqks)
-    q = torch.Tensor(np.linspace(0,0.65,1000))
+    obj2 = Kramer_interpolator(radius=radius, Iqks=Iqks)
+    q = torch.Tensor(np.linspace(0,0.35,1000))
     tmp = obj2(q).detach()
 
-    plt.plot(q_obs,m, '.')
+    plt.plot(q_obs, m, '.')
     yyy1 = obj1().detach().numpy().flatten()
     plt.plot(q_obs, yyy1, '--', c='r')
     plt.plot(q, tmp, '-', c='g')
@@ -157,8 +278,10 @@ if __name__ == "__main__":
 
 
 
-
-
-
-
-
+    training(obj2, F.l1_loss , q_obs, m, s, learning_rate=1e-2)
+    tmp = obj2(q_obs)
+    plt.plot(q_obs.numpy(), tmp.detach().flatten().numpy())
+    plt.plot(q_obs.numpy(), m.numpy(), '.')
+    plt.yscale('log')
+    plt.show()
+    """
